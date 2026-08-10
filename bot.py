@@ -465,6 +465,8 @@ async def handle_main_menu(query, update, context):
 
 # ===== Бизнес-логика сканирования =====
 
+# ===== Бизнес-логика сканирования =====
+
 async def run_full_scan():
     """
     Основная логика сканирования рынка с подробной диагностикой.
@@ -504,6 +506,7 @@ async def run_full_scan():
         }
         
         # Для диагностики: собираем примеры отфильтрованных
+        examples_passed = []  # Прошедшие фильтр
         examples_low_volume = []
         examples_low_price = []
         
@@ -514,7 +517,7 @@ async def run_full_scan():
                 short_name = row['short_name']
                 sec_type = row.get('sec_type', '')
                 
-                # Фильтр 1: Тип инструмента
+                # Фильтр 1: Тип инструмента (уже отфильтрован, но проверяем на всякий случай)
                 if not is_valid_share_type(sec_type):
                     skipped['not_share'] += 1
                     continue
@@ -543,17 +546,21 @@ async def run_full_scan():
                     skipped['low_volume'] += 1
                     if len(examples_low_volume) < 5:
                         examples_low_volume.append(
-                            f"{ticker} ({avg_vol_rub:,.0f}₽)"
+                            f"{ticker} ({avg_vol_rub:,.0f}₽/день)"
                         )
                     continue
                 
-                # Добавляем в список для анализа
+                # Бумага прошла все фильтры!
                 filtered_tickers.append({
                     'ticker': ticker,
                     'short_name': short_name,
                     'lot_size': lot_size,
                     'candles': candles
                 })
+                
+                # Сохраняем примеры прошедших
+                if len(examples_passed) < 10:
+                    examples_passed.append(f"{ticker} ({short_name}) - цена: {close_price:.2f}₽")
                 
             except Exception as e:
                 skipped['api_error'] += 1
@@ -565,21 +572,30 @@ async def run_full_scan():
         logger.info("\n" + "📊 " + "=" * 58)
         logger.info("📊 ИТОГИ ФИЛЬТРАЦИИ")
         logger.info("📊 " + "=" * 58)
-        logger.info(f"📥 Загружено всего: {total_loaded}")
-        logger.info(f"❌ Не акции (тип): {skipped['not_share']}")
+        logger.info(f"📥 Загружено акций (после фильтра типа): {total_loaded}")
         logger.info(f"❌ Нет свечей/мало данных: {skipped['no_candles']}")
         logger.info(f"❌ Цена < {config.MIN_PRICE}₽: {skipped['low_price']}")
         logger.info(f"❌ Объем < {config.MIN_AVG_VOLUME_RUB:,.0f}₽: {skipped['low_volume']}")
         logger.info(f"❌ Ошибки API: {skipped['api_error']}")
         logger.info(f"✅ ОСТАЛОСЬ ДЛЯ АНАЛИЗА: {len(filtered_tickers)}")
         
+        if examples_passed:
+            logger.info(f"\n✅ Примеры ПРОШЕДШИХ все фильтры (первые 10):")
+            for ex in examples_passed:
+                logger.info(f"   {ex}")
+        
         if examples_low_price:
-            logger.info(f"📉 Примеры отсеянных по цене: {', '.join(examples_low_price)}")
+            logger.info(f"\n📉 Примеры отсеянных по цене (<{config.MIN_PRICE}₽):")
+            for ex in examples_low_price:
+                logger.info(f"   {ex}")
+        
         if examples_low_volume:
-            logger.info(f"📉 Примеры отсеянных по объему: {', '.join(examples_low_volume)}")
+            logger.info(f"\n📉 Примеры отсеянных по объему (<{config.MIN_AVG_VOLUME_RUB:,.0f}₽):")
+            for ex in examples_low_volume:
+                logger.info(f"   {ex}")
         
         if len(filtered_tickers) == 0:
-            logger.warning("⚠️ ПОСЛЕ ФИЛЬТРАЦИИ НЕ ОСТАЛОСЬ БУМАГ ДЛЯ АНАЛИЗА!")
+            logger.warning("\n⚠️ ПОСЛЕ ФИЛЬТРАЦИИ НЕ ОСТАЛОСЬ БУМАГ ДЛЯ АНАЛИЗА!")
             logger.warning("⚠️ Возможные причины:")
             logger.warning(f"   1. Все бумаги имеют цену < {config.MIN_PRICE}₽")
             logger.warning(f"   2. Средний объем всех бумаг < {config.MIN_AVG_VOLUME_RUB:,.0f}₽")
@@ -628,7 +644,7 @@ async def run_full_scan():
                 if analyzed % 50 == 0:
                     logger.info(
                         f"   Прогресс: {analyzed}/{len(filtered_tickers)} | "
-                        f"Найдено: {patterns_found}"
+                        f"Найдено паттернов: {patterns_found}"
                     )
                     await asyncio.sleep(0.1)
                     
@@ -687,41 +703,6 @@ async def run_full_scan():
     except Exception as e:
         logger.error(f"❌ КРИТИЧЕСКАЯ ОШИБКА: {e}", exc_info=True)
         return f"⚠️ Ошибка при сканировании: {str(e)[:200]}"
-async def scheduled_scan(context: ContextTypes.DEFAULT_TYPE):
-    """Задача для автоматической рассылки."""
-    global last_scan_report, last_scan_time
-    
-    logger.info("Запуск планового сканирования...")
-    
-    subscribers = db.get_active_subscribers()
-    if not subscribers:
-        logger.warning("Нет активных подписчиков")
-        return
-    
-    try:
-        scan_result = await run_full_scan()
-        last_scan_report = scan_result
-        last_scan_time = datetime.now(MOSCOW_TZ)
-        
-        success = 0
-        for chat_id in subscribers:
-            try:
-                await context.bot.send_message(
-                    chat_id=chat_id,
-                    text=scan_result,
-                    parse_mode="HTML"
-                )
-                success += 1
-            except Exception as e:
-                logger.error(f"Ошибка отправки {chat_id}: {e}")
-                if "bot was blocked" in str(e).lower():
-                    db.remove_subscriber(chat_id)
-        
-        logger.info(f"Рассылка завершена: {success}/{len(subscribers)}")
-        
-    except Exception as e:
-        logger.error(f"Ошибка плановой рассылки: {e}", exc_info=True)
-
 # ===== Инициализация бота =====
 
 async def setup_bot():
