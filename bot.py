@@ -32,11 +32,11 @@ db = SubscriberDB()
 # ===== Веб-сервер для Render =====
 
 async def health_check(request):
-    """Эндпоинт для проверки здоровья сервера (Render и UptimeRobot)."""
+    """Эндпоинт для проверки здоровья сервера."""
     return web.Response(text="OK", status=200)
 
 async def ping(request):
-    """Эндпоинт для UptimeRobot."""
+    """Эндпоинт для UptimeRobot с информацией о состоянии."""
     stats = db.get_stats()
     return web.json_response({
         "status": "alive",
@@ -45,26 +45,11 @@ async def ping(request):
         "bot_active": True
     })
 
-async def manual_scan(request):
-    """Эндпоинт для ручного запуска сканирования через HTTP (опционально)."""
-    try:
-        scan_result = await run_full_scan()
-        return web.json_response({
-            "status": "success",
-            "result": scan_result[:1000] + "..." if len(scan_result) > 1000 else scan_result
-        })
-    except Exception as e:
-        return web.json_response({
-            "status": "error",
-            "message": str(e)
-        }, status=500)
-
 def create_web_app():
     """Создание веб-приложения aiohttp."""
     app = web.Application()
     app.router.add_get('/', health_check)
     app.router.add_get('/ping', ping)
-    app.router.add_get('/scan', manual_scan)
     return app
 
 # ===== Telegram Bot Handlers =====
@@ -145,8 +130,12 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     if query.data == "scan":
         await query.edit_message_text("⏳ Выполняю сканирование рынка... это займет около минуты.")
-        scan_result = await run_full_scan()
-        await query.edit_message_text(scan_result, parse_mode="HTML")
+        try:
+            scan_result = await run_full_scan()
+            await query.edit_message_text(scan_result, parse_mode="HTML")
+        except Exception as e:
+            logger.error(f"Ошибка сканирования: {e}")
+            await query.edit_message_text("❌ Произошла ошибка при сканировании. Попробуйте позже.")
     
     elif query.data == "stats":
         stats = db.get_stats()
@@ -161,15 +150,19 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif query.data == "unsubscribe":
         chat_id = update.effective_chat.id
         if db.remove_subscriber(chat_id):
-            await query.edit_message_text("❌ Вы успешно отписались от рассылки.")
+            await query.edit_message_text("❌ Вы успешно отписались от рассылки. Используйте /start чтобы подписаться снова.")
         else:
-            await query.edit_message_text("⚠️ Ошибка при отписке.")
+            await query.edit_message_text("⚠️ Ошибка при отписке. Попробуйте позже.")
 
 async def scan_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обработчик команды /scan."""
     msg = await update.message.reply_text("⏳ Анализирую акции Московской биржи...")
-    scan_result = await run_full_scan()
-    await msg.edit_text(scan_result, parse_mode="HTML")
+    try:
+        scan_result = await run_full_scan()
+        await msg.edit_text(scan_result, parse_mode="HTML")
+    except Exception as e:
+        logger.error(f"Ошибка сканирования: {e}")
+        await msg.edit_text("❌ Произошла ошибка при сканировании.")
 
 # ===== Бизнес-логика сканирования =====
 
@@ -219,6 +212,8 @@ async def run_full_scan():
                 logger.error(f"Ошибка обработки {ticker}: {e}")
                 continue
         
+        logger.info(f"Сканирование завершено. Найдено сигналов: {len(candidates)}, ошибок: {errors}")
+        
         # Сортировка и форматирование
         candidates.sort(key=lambda x: x['score'], reverse=True)
         top_candidates = candidates[:config.TOP_LIMIT]
@@ -229,7 +224,7 @@ async def run_full_scan():
         
         report_lines = [
             f"📅 <b>Обзор «Молот» ({date_str})</b>",
-            f"📊 Проанализировано: {total_tickers} | Сигналов: {len(candidates)} | Топ-{config.TOP_LIMIT}\n"
+            f"📊 Проанализировано: {total_tickers} | Сигналов: {len(candidates)} | Топ-{min(config.TOP_LIMIT, len(top_candidates))}\n"
         ]
         
         medals = ["🥇", "🥈", "🥉"] + ["  "] * 7
@@ -244,13 +239,13 @@ async def run_full_scan():
             report_lines.append(line)
         
         if not top_candidates:
-            report_lines.append("❌ Сигналов сегодня нет. Ждем формирования паттернов.")
+            report_lines.append("❌ Качественных паттернов «Молот» на ликвидных бумагах сегодня не найдено.")
         
         return "\n\n".join(report_lines)
         
     except Exception as e:
         logger.error(f"Критическая ошибка сканирования: {e}", exc_info=True)
-        return f"⚠️ Ошибка: {str(e)[:200]}"
+        return f"⚠️ Ошибка при сканировании: {str(e)[:200]}"
 
 async def scheduled_scan(context: ContextTypes.DEFAULT_TYPE):
     """Задача для автоматической рассылки."""
@@ -261,44 +256,47 @@ async def scheduled_scan(context: ContextTypes.DEFAULT_TYPE):
         logger.warning("Нет активных подписчиков")
         return
     
-    scan_result = await run_full_scan()
-    success = 0
-    
-    for chat_id in subscribers:
-        try:
-            await context.bot.send_message(
-                chat_id=chat_id,
-                text=scan_result,
-                parse_mode="HTML"
-            )
-            success += 1
-        except Exception as e:
-            logger.error(f"Ошибка отправки {chat_id}: {e}")
-            if "bot was blocked" in str(e) or "deactivated" in str(e):
-                db.remove_subscriber(chat_id)
-    
-    logger.info(f"Рассылка завершена: {success}/{len(subscribers)}")
+    try:
+        scan_result = await run_full_scan()
+        success = 0
+        
+        for chat_id in subscribers:
+            try:
+                await context.bot.send_message(
+                    chat_id=chat_id,
+                    text=scan_result,
+                    parse_mode="HTML"
+                )
+                success += 1
+            except Exception as e:
+                logger.error(f"Ошибка отправки {chat_id}: {e}")
+                # Если бот заблокирован пользователем - отписываем
+                if "bot was blocked" in str(e).lower() or "deactivated" in str(e).lower():
+                    db.remove_subscriber(chat_id)
+                    logger.info(f"Подписчик {chat_id} удален (заблокировал бота)")
+        
+        logger.info(f"Рассылка завершена: {success}/{len(subscribers)}")
+        
+    except Exception as e:
+        logger.error(f"Ошибка плановой рассылки: {e}", exc_info=True)
 
-# ===== Главная функция =====
-
-async def main():
-    """Запуск бота и веб-сервера."""
-    
+async def setup_bot():
+    """Настройка и запуск бота."""
     # Проверка токена
     if not config.TELEGRAM_TOKEN or config.TELEGRAM_TOKEN == "YOUR_TOKEN_HERE":
         logger.error("❌ Не указан TELEGRAM_BOT_TOKEN!")
-        return
+        raise ValueError("TELEGRAM_BOT_TOKEN не установлен")
     
     # Создание приложения Telegram
-    app = Application.builder().token(config.TELEGRAM_TOKEN).build()
+    application = Application.builder().token(config.TELEGRAM_TOKEN).build()
     
     # Регистрация обработчиков
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("help", help_command))
-    app.add_handler(CommandHandler("scan", scan_command))
-    app.add_handler(CommandHandler("stats", stats_command))
-    app.add_handler(CommandHandler("unsubscribe", unsubscribe_command))
-    app.add_handler(CallbackQueryHandler(button_handler))
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("help", help_command))
+    application.add_handler(CommandHandler("scan", scan_command))
+    application.add_handler(CommandHandler("stats", stats_command))
+    application.add_handler(CommandHandler("unsubscribe", unsubscribe_command))
+    application.add_handler(CallbackQueryHandler(button_handler))
     
     # Настройка планировщика
     scheduler = AsyncIOScheduler(timezone=MOSCOW_TZ)
@@ -308,7 +306,7 @@ async def main():
             hour=config.MORNING_SCAN_HOUR,
             minute=config.MORNING_SCAN_MINUTE
         ),
-        args=[app],
+        args=[application],
         id="morning_scan",
         replace_existing=True
     )
@@ -318,29 +316,50 @@ async def main():
             hour=config.EVENING_SCAN_HOUR,
             minute=config.EVENING_SCAN_MINUTE
         ),
-        args=[app],
+        args=[application],
         id="evening_scan",
         replace_existing=True
     )
     scheduler.start()
-    logger.info(f"⏰ Планировщик запущен: {config.MORNING_SCAN_HOUR}:{config.MORNING_SCAN_MINUTE} и {config.EVENING_SCAN_HOUR}:{config.EVENING_SCAN_MINUTE} МСК")
+    logger.info(f"⏰ Планировщик запущен: {config.MORNING_SCAN_HOUR}:{config.MORNING_SCAN_MINUTE:02d} и {config.EVENING_SCAN_HOUR}:{config.EVENING_SCAN_MINUTE:02d} МСК")
     
-    # Запуск веб-сервера
-    web_app = create_web_app()
-    runner = web.AppRunner(web_app)
-    await runner.setup()
-    site = web.TCPSite(runner, '0.0.0.0', config.PORT)
-    await site.start()
-    logger.info(f"🌐 Веб-сервер запущен на порту {config.PORT}")
+    # Инициализация бота
+    await application.initialize()
+    await application.start()
+    await application.updater.start_polling(allowed_updates=Update.ALL_TYPES)
     
-    # Запуск бота
     logger.info("🤖 Бот запущен и готов к работе!")
-    await app.run_polling(allowed_updates=Update.ALL_TYPES)
+    
+    return application
+
+async def main():
+    """Главная функция - запуск веб-сервера и бота."""
+    try:
+        # Запускаем бота
+        application = await setup_bot()
+        
+        # Запускаем веб-сервер
+        web_app = create_web_app()
+        runner = web.AppRunner(web_app)
+        await runner.setup()
+        site = web.TCPSite(runner, '0.0.0.0', config.PORT)
+        await site.start()
+        logger.info(f"🌐 Веб-сервер запущен на порту {config.PORT}")
+        
+        # Держим приложение запущенным
+        # Создаем событие, которое никогда не завершится
+        stop_event = asyncio.Event()
+        await stop_event.wait()
+        
+    except Exception as e:
+        logger.error(f"Критическая ошибка: {e}", exc_info=True)
+        raise
+    finally:
+        # Корректное завершение
+        if 'application' in locals():
+            await application.stop()
+            await application.shutdown()
 
 if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        logger.info("Бот остановлен")
-    except Exception as e:
-        logger.error(f"Критическая ошибка: {e}")
+    # Запускаем приложение
+    asyncio.run(main())
