@@ -463,31 +463,49 @@ async def handle_main_menu(query, update, context):
 
 # ===== Бизнес-логика сканирования =====
 
+# ===== Бизнес-логика сканирования =====
+
 async def run_full_scan():
     """
-    Основная логика сканирования рынка.
-    Выполняет все проверки согласно новому ТЗ.
+    Основная логика сканирования рынка с подробной диагностикой.
     """
     try:
+        # ДИАГНОСТИКА: Загружаем свечи SBER
+        from moex_parser import diagnose_sber_candles
+        diagnose_sber_candles()
+        
         # Шаг 1: Получаем отфильтрованный список тикеров
+        logger.info("\n" + "🔍 " + "=" * 58)
+        logger.info("🔍 НАЧАЛО ПОЛНОГО СКАНИРОВАНИЯ")
+        logger.info("🔍 " + "=" * 58)
+        
         tickers_df = get_filtered_tickers()
-        total_loaded = len(tickers_df)
         
         if tickers_df.empty:
+            logger.error("❌ КРИТИЧЕСКАЯ ОШИБКА: Не удалось загрузить список инструментов")
             return (
                 "⚠️ <b>Не удалось загрузить список инструментов.</b>\n\n"
                 "Возможно, API Мосбиржи недоступно.\n"
                 "Попробуйте позже."
             )
         
-        logger.info(f"Загружено {total_loaded} тикеров. Начинаю фильтрацию...")
+        total_loaded = len(tickers_df)
+        logger.info(f"\n📊 НАЧАЛО ФИЛЬТРАЦИИ {total_loaded} бумаг")
+        logger.info("-" * 60)
         
         # Шаг 2: Применяем фильтры к каждому тикеру
         filtered_tickers = []
-        skipped_no_candles = 0
-        skipped_not_share = 0
-        skipped_low_volume = 0
-        skipped_low_price = 0
+        skipped = {
+            'no_candles': 0,
+            'not_share': 0,
+            'low_volume': 0,
+            'low_price': 0,
+            'api_error': 0
+        }
+        
+        # Для диагностики: собираем примеры отфильтрованных
+        examples_low_volume = []
+        examples_low_price = []
         
         for idx, row in tickers_df.iterrows():
             try:
@@ -496,33 +514,40 @@ async def run_full_scan():
                 short_name = row['short_name']
                 sec_type = row.get('sec_type', '')
                 
-                # Фильтр 1: Тип инструмента (common_share или preferred_share)
+                # Фильтр 1: Тип инструмента
                 if not is_valid_share_type(sec_type):
-                    skipped_not_share += 1
+                    skipped['not_share'] += 1
                     continue
                 
                 # Загружаем свечи
                 candles = get_daily_candles(ticker, days=60)
                 if candles is None or len(candles) < 60:
-                    skipped_no_candles += 1
+                    skipped['no_candles'] += 1
                     continue
                 
                 # Получаем последнюю свечу
                 last_candle = candles.iloc[-1]
-                close_price = last_candle['close']
+                close_price = float(last_candle['close'])
+                volume = float(last_candle['volume'])
                 
                 # Фильтр 2: Минимальная цена
                 if close_price <= config.MIN_PRICE:
-                    skipped_low_price += 1
+                    skipped['low_price'] += 1
+                    if len(examples_low_price) < 5:
+                        examples_low_price.append(f"{ticker} ({close_price:.2f}₽)")
                     continue
                 
                 # Фильтр 3: Ликвидность (средний объем в рублях)
                 avg_vol_rub = calculate_average_volume_rub(candles, lot_size)
                 if avg_vol_rub < config.MIN_AVG_VOLUME_RUB:
-                    skipped_low_volume += 1
+                    skipped['low_volume'] += 1
+                    if len(examples_low_volume) < 5:
+                        examples_low_volume.append(
+                            f"{ticker} ({avg_vol_rub:,.0f}₽)"
+                        )
                     continue
                 
-                # Добавляем в список для дальнейшего анализа
+                # Добавляем в список для анализа
                 filtered_tickers.append({
                     'ticker': ticker,
                     'short_name': short_name,
@@ -531,21 +556,63 @@ async def run_full_scan():
                 })
                 
             except Exception as e:
-                logger.error(f"Ошибка фильтрации {ticker}: {e}")
+                skipped['api_error'] += 1
+                if skipped['api_error'] <= 3:
+                    logger.error(f"Ошибка обработки {ticker}: {e}")
                 continue
         
-        logger.info(
-            f"Фильтрация завершена. "
-            f"Пропущено: не акции={skipped_not_share}, "
-            f"нет свечей={skipped_no_candles}, "
-            f"низкая цена={skipped_low_price}, "
-            f"низкий объем={skipped_low_volume}"
-        )
-        logger.info(f"Осталось для анализа: {len(filtered_tickers)} бумаг")
+        # ДИАГНОСТИКА: Итоги фильтрации
+        logger.info("\n" + "📊 " + "=" * 58)
+        logger.info("📊 ИТОГИ ФИЛЬТРАЦИИ")
+        logger.info("📊 " + "=" * 58)
+        logger.info(f"📥 Загружено всего: {total_loaded}")
+        logger.info(f"❌ Не акции (тип): {skipped['not_share']}")
+        logger.info(f"❌ Нет свечей/мало данных: {skipped['no_candles']}")
+        logger.info(f"❌ Цена < {config.MIN_PRICE}₽: {skipped['low_price']}")
+        logger.info(f"❌ Объем < {config.MIN_AVG_VOLUME_RUB:,.0f}₽: {skipped['low_volume']}")
+        logger.info(f"❌ Ошибки API: {skipped['api_error']}")
+        logger.info(f"✅ ОСТАЛОСЬ ДЛЯ АНАЛИЗА: {len(filtered_tickers)}")
         
-        # Шаг 3: Поиск паттерна "Молот" по отфильтрованным бумагам
+        if examples_low_price:
+            logger.info(f"📉 Примеры отсеянных по цене: {', '.join(examples_low_price)}")
+        if examples_low_volume:
+            logger.info(f"📉 Примеры отсеянных по объему: {', '.join(examples_low_volume)}")
+        
+        if len(filtered_tickers) == 0:
+            logger.warning("⚠️ ПОСЛЕ ФИЛЬТРАЦИИ НЕ ОСТАЛОСЬ БУМАГ ДЛЯ АНАЛИЗА!")
+            logger.warning("⚠️ Возможные причины:")
+            logger.warning(f"   1. Все бумаги имеют цену < {config.MIN_PRICE}₽")
+            logger.warning(f"   2. Средний объем всех бумаг < {config.MIN_AVG_VOLUME_RUB:,.0f}₽")
+            logger.warning("   3. API не возвращает свечи")
+            logger.warning("   4. Выходной день на бирже (нет торгов)")
+        
+        logger.info("📊 " + "=" * 58 + "\n")
+        
+        # Шаг 3: Поиск паттерна "Молот"
+        if len(filtered_tickers) == 0:
+            now_moscow = datetime.now(MOSCOW_TZ)
+            date_str = now_moscow.strftime("%a, %d.%m.%Y")
+            time_str = now_moscow.strftime("%H:%M МСК")
+            
+            return (
+                f"📅 *Ежедневный обзор «Молот» ({date_str})*\n"
+                f"🕐 Время: {time_str}\n"
+                f"📊 Проанализировано бумаг: 0\n"
+                f"❌ Качественных сигналов не найдено.\n\n"
+                f"💡 После фильтрации не осталось бумаг для анализа.\n"
+                f"Возможные причины:\n"
+                f"• Выходной день на бирже\n"
+                f"• Все бумаги ниже порога ликвидности\n"
+                f"• Технический сбой API\n\n"
+                f"Попробуйте позже в торговый день."
+            )
+        
+        logger.info(f"🔍 НАЧАЛО ПОИСКА ПАТТЕРНОВ среди {len(filtered_tickers)} бумаг")
+        logger.info("-" * 60)
+        
         candidates = []
         analyzed = 0
+        patterns_found = 0
         
         for item in filtered_tickers:
             try:
@@ -555,21 +622,27 @@ async def run_full_scan():
                     pattern_result['ticker'] = item['ticker']
                     pattern_result['short_name'] = item['short_name']
                     candidates.append(pattern_result)
+                    patterns_found += 1
                 
                 analyzed += 1
                 if analyzed % 50 == 0:
-                    logger.info(f"Проанализировано {analyzed}/{len(filtered_tickers)}...")
+                    logger.info(
+                        f"   Прогресс: {analyzed}/{len(filtered_tickers)} | "
+                        f"Найдено: {patterns_found}"
+                    )
                     await asyncio.sleep(0.1)
                     
             except Exception as e:
                 logger.error(f"Ошибка анализа {item['ticker']}: {e}")
                 continue
         
-        # Шаг 4: Сортировка по Score
+        logger.info(f"✅ АНАЛИЗ ЗАВЕРШЕН: найдено {len(candidates)} паттернов")
+        logger.info("=" * 60 + "\n")
+        
+        # Шаг 4: Сортировка и форматирование
         candidates.sort(key=lambda x: x['score'], reverse=True)
         top_candidates = candidates[:config.TOP_LIMIT]
         
-        # Шаг 5: Форматирование отчета
         now_moscow = datetime.now(MOSCOW_TZ)
         date_str = now_moscow.strftime("%a, %d.%m.%Y")
         time_str = now_moscow.strftime("%H:%M МСК")
@@ -582,7 +655,7 @@ async def run_full_scan():
         
         if top_candidates:
             report_lines.append(f"✅ Найдено качественных сигналов: {len(candidates)}")
-            report_lines.append("")  # Пустая строка
+            report_lines.append("")
             
             medals = ["🥇", "🥈", "🥉"] + ["  "] * 7
             
@@ -592,11 +665,10 @@ async def run_full_scan():
                     f"   📈 Score: *{c['score']}*",
                     f"   💰 Цена: {c['close']:.2f} ₽ | Тело: {c['body_pct']:.1f}% | Тень: {c['shadow_pct']:.1f}%",
                     f"   📉 Поддержка: {c['support']:.2f} ₽ | Объем: {c['volume_ratio']:.1f}x от среднего",
-                    ""  # Пустая строка между сигналами
+                    ""
                 ]
                 report_lines.extend(lines)
             
-            # Совет в конце
             report_lines.append(
                 "💡 *Что делать с сигналами?*\n"
                 "Проверь график в Т-Инвестициях. Если «Молот» подтверждается визуально — "
@@ -613,9 +685,8 @@ async def run_full_scan():
         return "\n".join(report_lines)
         
     except Exception as e:
-        logger.error(f"Критическая ошибка сканирования: {e}", exc_info=True)
+        logger.error(f"❌ КРИТИЧЕСКАЯ ОШИБКА: {e}", exc_info=True)
         return f"⚠️ Ошибка при сканировании: {str(e)[:200]}"
-
 async def scheduled_scan(context: ContextTypes.DEFAULT_TYPE):
     """Задача для автоматической рассылки."""
     global last_scan_report, last_scan_time
