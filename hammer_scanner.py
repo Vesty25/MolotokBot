@@ -1,4 +1,5 @@
 # hammer_scanner.py
+import pandas as pd
 import logging
 from config import (
     HAMMER_SHADOW_BODY_RATIO, HAMMER_MAX_UPPER_SHADOW,
