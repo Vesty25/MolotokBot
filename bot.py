@@ -336,7 +336,7 @@ async def execute_scan(strategy):
         candidates, stats = scan_ema50(market_data)
         return format_ema50_report(candidates, stats, date_str, time_str)
     
-    elif strategy == 'all':
+        elif strategy == 'all':
         # Запускаем все три
         hammer_cand, hammer_stats = scan_hammer(market_data)
         breakout_cand, breakout_stats = scan_breakout(market_data)
@@ -353,13 +353,13 @@ async def execute_scan(strategy):
             'ema50': report_ema50
         }
         
-        # Сводка
+        # Сводка (используем 'passed' вместо 'found')
         summary = (
             f"📊 *СВОДКА СТРАТЕГИЙ*\n"
             f"📅 {date_str} | {time_str}\n"
-            f"🔨 Молот: {hammer_stats['found']} сигнала\n"
-            f"🚀 Пробой тишины: {breakout_stats['found']} сигнала\n"
-            f"📈 Отскок от EMA 50: {ema50_stats['found']} сигнала\n"
+            f"🔨 Молот: {hammer_stats['passed']} сигнала\n"
+            f"🚀 Пробой тишины: {breakout_stats['passed']} сигнала\n"
+            f"📈 Отскок от EMA 50: {ema50_stats['passed']} сигнала\n"
             f"---\n"
             f"*Далее — детальные отчёты по каждой стратегии.*"
         )
@@ -369,9 +369,8 @@ async def execute_scan(strategy):
         # Объединяем всё
         full_report = summary + "\n\n" + report_hammer + "\n\n" + report_breakout + "\n\n" + report_ema50
         
-        # Обрезаем, если слишком длинное (Telegram лимит 4096 символов)
+        # Обрезаем, если слишком длинное (Telegram лимит 4096)
         if len(full_report) > 4000:
-            full_report = summary + "\n\n" + report_hammer + "\n\n" + report_breakout + "\n\n" + report_ema50
             full_report = full_report[:4000] + "\n\n⚠️ Отчёт обрезан из-за лимита Telegram."
         
         return full_report
