@@ -13,14 +13,11 @@ from apscheduler.triggers.cron import CronTrigger
 
 import config
 from database import SubscriberDB
-from moex_parser import (
-    get_filtered_tickers,
-    get_daily_candles,
-    calculate_average_volume_rub,
-    is_valid_share_type,
-    diagnose_sber_candles
-)
-from pattern_engine import find_hammer
+from moex_api import load_market_data
+
+from hammer_scanner import scan_hammer, format_hammer_report
+from breakout_scanner import scan_breakout, format_breakout_report
+from ema50_scanner import scan_ema50, format_ema50_report
 
 # Настройка логирования
 logging.basicConfig(
@@ -36,7 +33,7 @@ MOSCOW_TZ = pytz.timezone("Europe/Moscow")
 db = SubscriberDB()
 
 # Глобальные переменные для кэша
-last_scan_report = None
+last_reports = {}  # {'hammer': str, 'breakout': str, 'ema50': str, 'summary': str}
 last_scan_time = None
 
 # ===== Клавиатуры =====
@@ -44,18 +41,21 @@ last_scan_time = None
 def get_main_keyboard():
     """Основное меню бота (постоянная клавиатура)."""
     keyboard = [
-        [KeyboardButton("🔍 Сканировать рынок"), KeyboardButton("📊 Статистика")],
-        [KeyboardButton("ℹ️ Помощь"), KeyboardButton("🔔 Подписка")]
+        [KeyboardButton("🔨 Молот"), KeyboardButton("🚀 Пробой тишины")],
+        [KeyboardButton("📈 Отскок от EMA 50"), KeyboardButton("📊 Все стратегии")],
+        [KeyboardButton("ℹ️ Помощь"), KeyboardButton("📋 Статистика")]
     ]
     return ReplyKeyboardMarkup(keyboard, resize_keyboard=True, persistent=True)
 
-def get_inline_main_menu():
-    """Инлайн меню (под сообщениями)."""
+def get_inline_strategy_menu():
+    """Инлайн-меню выбора стратегии."""
     keyboard = [
-        [InlineKeyboardButton("🔍 Запросить анализ", callback_data="scan")],
-        [InlineKeyboardButton("📊 Статистика бота", callback_data="stats")],
-        [InlineKeyboardButton("📋 Последний отчет", callback_data="last_report")],
-        [InlineKeyboardButton("🔔 Управление подпиской", callback_data="subscription")]
+        [InlineKeyboardButton("🔨 Молот", callback_data="scan_hammer"),
+         InlineKeyboardButton("🚀 Пробой тишины", callback_data="scan_breakout")],
+        [InlineKeyboardButton("📈 Отскок от EMA 50", callback_data="scan_ema50")],
+        [InlineKeyboardButton("📊 ВСЕ СТРАТЕГИИ", callback_data="scan_all")],
+        [InlineKeyboardButton("📊 Статистика", callback_data="stats")],
+        [InlineKeyboardButton("🔔 Подписка", callback_data="subscription")]
     ]
     return InlineKeyboardMarkup(keyboard)
 
@@ -72,11 +72,9 @@ def get_subscription_menu():
 # ===== Веб-сервер =====
 
 async def health_check(request):
-    """Эндпоинт для проверки здоровья сервера."""
     return web.Response(text="OK", status=200)
 
 async def ping(request):
-    """Эндпоинт для UptimeRobot."""
     stats = db.get_stats()
     return web.json_response({
         "status": "alive",
@@ -86,7 +84,6 @@ async def ping(request):
     })
 
 def create_web_app():
-    """Создание веб-приложения."""
     app = web.Application()
     app.router.add_get('/', health_check)
     app.router.add_get('/ping', ping)
@@ -99,70 +96,57 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     chat_id = update.effective_chat.id
     
-    db.add_subscriber(
-        chat_id=chat_id,
-        username=user.username,
-        first_name=user.first_name
-    )
+    db.add_subscriber(chat_id=chat_id, username=user.username, first_name=user.first_name)
     
     welcome_text = (
         f"👋 <b>Привет, {user.first_name}!</b>\n\n"
         "Я бот «Молоток» 🔨\n"
-        "Ищу акции с бычьим паттерном «Молот» у уровня поддержки.\n\n"
+        "Анализирую рынок акций Мосбиржи по трём стратегиям:\n\n"
+        "🔨 <b>Молот</b> — разворот у поддержки\n"
+        "🚀 <b>Пробой тишины</b> — выход из боковика\n"
+        "📈 <b>Отскок от EMA 50</b> — вход в тренд\n\n"
         "📅 <b>Автоматическая рассылка:</b>\n"
         f"• Утро: {config.MORNING_SCAN_HOUR}:{config.MORNING_SCAN_MINUTE:02d} МСК\n"
         f"• Вечер: {config.EVENING_SCAN_HOUR}:{config.EVENING_SCAN_MINUTE:02d} МСК\n\n"
-        "🔍 <b>Как использовать:</b>\n"
-        "• Нажмите кнопку ниже для анализа\n"
-        "• Используйте меню для навигации\n"
-        "• Команда /scan для ручного запуска\n\n"
-        "💡 <i>Анализ рынка занимает 1-2 минуты</i>"
+        "Выберите стратегию в меню или нажмите кнопку:"
     )
     
     await update.message.reply_text(
         welcome_text,
         parse_mode="HTML",
-        reply_markup=get_inline_main_menu()
+        reply_markup=get_inline_strategy_menu()
     )
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Справка по командам."""
+    """Справка."""
     help_text = (
-        "🤖 <b>Бот «Молоток» - Справка</b>\n\n"
+        "🤖 <b>Бот «Молоток» — Справка</b>\n\n"
         "<b>📋 Команды:</b>\n"
-        "/start - Главное меню\n"
-        "/scan - Запустить анализ рынка\n"
-        "/stats - Статистика бота\n"
-        "/subscribe - Подписаться на рассылку\n"
-        "/unsubscribe - Отписаться от рассылки\n"
-        "/help - Эта справка\n\n"
-        "<b>🔍 Что анализирует бот:</b>\n"
-        "• Только обыкновенные и привилегированные акции\n"
-        "• Цена закрытия > 10 ₽ (без мусорных бумаг)\n"
-        "• Средний объем > 10 млн руб/день\n"
-        "• Тело свечи ≥ 0.5% от цены\n"
-        "• Нижняя тень ≥ 2% от цены\n"
-        "• Паттерн «Молот» у 60-дневного минимума\n"
-        "• Подтверждение повышенным объемом\n\n"
-        "<b>📊 Как читать сигналы:</b>\n"
-        "Score - сила сигнала (чем выше, тем лучше)\n"
-        "Тело - размер тела свечи в %\n"
-        "Тень - размер нижней тени в %\n"
-        "Объем - превышение над средним\n\n"
-        "<b>⚠️ Важно:</b>\n"
-        "Проверяйте сигналы визуально!\n"
-        "Используйте стоп-лосс -2%."
+        "/start — Главное меню\n"
+        "/scan — Запустить все стратегии\n"
+        "/hammer — Стратегия «Молот»\n"
+        "/breakout — Стратегия «Пробой тишины»\n"
+        "/ema50 — Стратегия «Отскок от EMA 50»\n"
+        "/stats — Статистика\n"
+        "/subscribe — Подписаться\n"
+        "/unsubscribe — Отписаться\n"
+        "/help — Эта справка\n\n"
+        "<b>🔍 Стратегии:</b>\n"
+        "🔨 <b>Молот:</b> свечной паттерн у 60-дневного минимума\n"
+        "🚀 <b>Пробой тишины:</b> выход из узкого боковика на объёме\n"
+        "📈 <b>Отскок от EMA 50:</b> коррекция к скользящей средней в тренде\n\n"
+        "💡 <i>Анализ занимает 1-2 минуты</i>"
     )
     
     await update.message.reply_text(help_text, parse_mode="HTML")
 
 async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Показать статистику."""
+    """Статистика."""
     stats = db.get_stats()
     current_time = datetime.now(MOSCOW_TZ)
     
     stats_text = (
-        "📊 <b>Статистика бота «Молоток»</b>\n\n"
+        "📊 <b>Статистика бота</b>\n\n"
         f"👥 Активных подписчиков: <b>{stats['active']}</b>\n"
         f"📝 Всего пользователей: <b>{stats['total']}</b>\n"
         f"⏰ Время сервера: <b>{current_time.strftime('%H:%M МСК')}</b>\n"
@@ -170,111 +154,66 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     
     if last_scan_time:
-        stats_text += f"🕐 Последний анализ: <b>{last_scan_time.strftime('%H:%M:%S МСК')}</b>\n"
+        stats_text += f"🕐 Последний анализ: <b>{last_scan_time.strftime('%H:%M:%S МСК')}</b>"
     else:
-        stats_text += "🕐 Последний анализ: <b>еще не проводился</b>\n"
-    
-    stats_text += (
-        f"\n🔔 Рассылка: <b>{config.MORNING_SCAN_HOUR}:{config.MORNING_SCAN_MINUTE:02d} "
-        f"и {config.EVENING_SCAN_HOUR}:{config.EVENING_SCAN_MINUTE:02d} МСК</b>"
-    )
+        stats_text += "🕐 Последний анализ: <b>ещё не проводился</b>"
     
     await update.message.reply_text(stats_text, parse_mode="HTML")
 
 async def subscribe_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Подписка на рассылку."""
     user = update.effective_user
     chat_id = update.effective_chat.id
     
     if db.add_subscriber(chat_id, user.username, user.first_name):
         await update.message.reply_text(
-            f"✅ <b>Вы подписаны на рассылку!</b>\n\n"
-            f"Теперь вы будете получать:\n"
-            f"• Утренний анализ в {config.MORNING_SCAN_HOUR}:{config.MORNING_SCAN_MINUTE:02d} МСК\n"
-            f"• Вечерний анализ в {config.EVENING_SCAN_HOUR}:{config.EVENING_SCAN_MINUTE:02d} МСК\n\n"
-            "Чтобы отписаться, используйте /unsubscribe",
+            f"✅ <b>Вы подписаны!</b>\n"
+            f"Рассылка в {config.MORNING_SCAN_HOUR}:{config.MORNING_SCAN_MINUTE:02d} "
+            f"и {config.EVENING_SCAN_HOUR}:{config.EVENING_SCAN_MINUTE:02d} МСК",
             parse_mode="HTML"
         )
     else:
-        await update.message.reply_text("❌ Произошла ошибка. Попробуйте позже.")
+        await update.message.reply_text("❌ Ошибка подписки.")
 
 async def unsubscribe_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Отписка от рассылки."""
     chat_id = update.effective_chat.id
     
     if db.remove_subscriber(chat_id):
-        await update.message.reply_text(
-            "❌ <b>Вы отписались от рассылки.</b>\n\n"
-            "Вы больше не будете получать автоматические отчеты.\n"
-            "Но вы всегда можете запустить анализ вручную!\n\n"
-            "Чтобы подписаться снова, используйте /subscribe",
-            parse_mode="HTML"
-        )
+        await update.message.reply_text("❌ <b>Вы отписались от рассылки.</b>", parse_mode="HTML")
     else:
-        await update.message.reply_text("⚠️ Вы не были подписаны или произошла ошибка.")
+        await update.message.reply_text("⚠️ Вы не были подписаны.")
 
-async def scan_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработчик команды /scan."""
-    global last_scan_report, last_scan_time
-    
-    msg = await update.message.reply_text(
-        "🔍 <b>Запускаю анализ рынка...</b>\n\n"
-        "⏳ Фильтрация инструментов, загрузка свечей...\n"
-        "Это займет 1-2 минуты.",
-        parse_mode="HTML"
-    )
-    
-    if update.effective_chat:
-        await context.bot.send_chat_action(
-            chat_id=update.effective_chat.id,
-            action="typing"
-        )
-    
-    try:
-        scan_result = await run_full_scan()
-        last_scan_report = scan_result
-        last_scan_time = datetime.now(MOSCOW_TZ)
-        
-        await msg.edit_text(scan_result, parse_mode="HTML")
-    except Exception as e:
-        logger.error(f"Ошибка сканирования: {e}", exc_info=True)
-        await msg.edit_text(
-            "❌ <b>Произошла ошибка при сканировании.</b>\n\n"
-            "Попробуйте позже или обратитесь к администратору.",
-            parse_mode="HTML"
-        )
+# ===== Команды для отдельных стратегий =====
+
+async def hammer_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await run_single_strategy(update, context, 'hammer')
+
+async def breakout_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await run_single_strategy(update, context, 'breakout')
+
+async def ema50_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await run_single_strategy(update, context, 'ema50')
+
+async def scan_all_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await run_single_strategy(update, context, 'all')
 
 # ===== Обработчики текстовых сообщений =====
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработчик текстовых сообщений (кнопок меню)."""
+    """Обработчик кнопок постоянного меню."""
     text = update.message.text
     
-    if text == "🔍 Сканировать рынок":
-        await scan_command(update, context)
-    elif text == "📊 Статистика":
-        await stats_command(update, context)
+    if text == "🔨 Молот":
+        await run_single_strategy(update, context, 'hammer')
+    elif text == "🚀 Пробой тишины":
+        await run_single_strategy(update, context, 'breakout')
+    elif text == "📈 Отскок от EMA 50":
+        await run_single_strategy(update, context, 'ema50')
+    elif text == "📊 Все стратегии":
+        await run_single_strategy(update, context, 'all')
     elif text == "ℹ️ Помощь":
         await help_command(update, context)
-    elif text == "🔔 Подписка":
-        chat_id = update.effective_chat.id
-        subs = db.get_active_subscribers()
-        is_subscribed = chat_id in subs
-        
-        status = "✅ <b>Вы подписаны</b>" if is_subscribed else "❌ <b>Вы не подписаны</b>"
-        
-        await update.message.reply_text(
-            f"🔔 <b>Управление подпиской</b>\n\n"
-            f"Статус: {status}\n\n"
-            "Выберите действие:",
-            parse_mode="HTML",
-            reply_markup=get_subscription_menu()
-        )
-    else:
-        await update.message.reply_text(
-            "Используйте кнопки меню или команды.\n"
-            "Введите /help для справки."
-        )
+    elif text == "📋 Статистика":
+        await stats_command(update, context)
 
 # ===== Обработчик инлайн-кнопок =====
 
@@ -283,383 +222,165 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     
-    if query.data == "scan":
-        global last_scan_report, last_scan_time
-        
-        await query.edit_message_text(
-            "🔍 <b>Запускаю анализ рынка...</b>\n\n"
-            "⏳ Фильтрация инструментов, загрузка свечей...",
-            parse_mode="HTML"
-        )
-        
-        if update.effective_chat:
-            await context.bot.send_chat_action(
-                chat_id=update.effective_chat.id,
-                action="typing"
-            )
-        
-        try:
-            scan_result = await run_full_scan()
-            last_scan_report = scan_result
-            last_scan_time = datetime.now(MOSCOW_TZ)
-            
-            await query.edit_message_text(scan_result, parse_mode="HTML")
-        except Exception as e:
-            logger.error(f"Ошибка сканирования: {e}", exc_info=True)
-            await query.edit_message_text(
-                "❌ <b>Ошибка при сканировании.</b>\n\n"
-                "Попробуйте позже.",
-                parse_mode="HTML",
-                reply_markup=get_inline_main_menu()
-            )
-    
+    if query.data == "scan_hammer":
+        await run_single_strategy_inline(query, context, 'hammer')
+    elif query.data == "scan_breakout":
+        await run_single_strategy_inline(query, context, 'breakout')
+    elif query.data == "scan_ema50":
+        await run_single_strategy_inline(query, context, 'ema50')
+    elif query.data == "scan_all":
+        await run_single_strategy_inline(query, context, 'all')
     elif query.data == "stats":
         stats = db.get_stats()
         current_time = datetime.now(MOSCOW_TZ)
-        
-        stats_text = (
-            "📊 <b>Статистика бота «Молоток»</b>\n\n"
-            f"👥 Активных подписчиков: <b>{stats['active']}</b>\n"
-            f"📝 Всего пользователей: <b>{stats['total']}</b>\n"
-            f"⏰ Время сервера: <b>{current_time.strftime('%H:%M МСК')}</b>\n"
-            f"📅 Дата: <b>{current_time.strftime('%d.%m.%Y')}</b>\n\n"
-        )
-        
-        if last_scan_time:
-            stats_text += f"🕐 Последний анализ: <b>{last_scan_time.strftime('%H:%M:%S МСК')}</b>"
-        else:
-            stats_text += "🕐 Последний анализ: <b>еще не проводился</b>"
-        
         await query.edit_message_text(
-            stats_text,
+            f"📊 <b>Статистика</b>\n\n"
+            f"👥 Подписчиков: {stats['active']}\n"
+            f"⏰ {current_time.strftime('%H:%M МСК')}",
             parse_mode="HTML",
-            reply_markup=get_inline_main_menu()
+            reply_markup=get_inline_strategy_menu()
         )
-    
-    elif query.data == "last_report":
-        if last_scan_report and last_scan_time:
-            await query.edit_message_text(
-                f"📋 <b>Последний отчет</b>\n"
-                f"🕐 Время: {last_scan_time.strftime('%H:%M:%S МСК')}\n\n"
-                f"{last_scan_report}",
-                parse_mode="HTML"
-            )
-        else:
-            await query.edit_message_text(
-                "📋 <b>Отчетов пока нет</b>\n\n"
-                "Запустите первый анализ!",
-                parse_mode="HTML",
-                reply_markup=get_inline_main_menu()
-            )
-    
     elif query.data == "subscription":
         chat_id = query.message.chat_id
         subs = db.get_active_subscribers()
         is_subscribed = chat_id in subs
-        
-        status = "✅ <b>Вы подписаны</b>" if is_subscribed else "❌ <b>Вы не подписаны</b>"
-        
+        status = "✅ Подписан" if is_subscribed else "❌ Не подписан"
         await query.edit_message_text(
-            f"🔔 <b>Управление подпиской</b>\n\n"
-            f"Статус: {status}\n\n"
-            "Выберите действие:",
+            f"🔔 <b>Управление подпиской</b>\n\nСтатус: {status}",
             parse_mode="HTML",
             reply_markup=get_subscription_menu()
         )
-    
     elif query.data == "sub_on":
         user = query.from_user
         chat_id = query.message.chat_id
-        
         if db.add_subscriber(chat_id, user.username, user.first_name):
-            await query.edit_message_text(
-                f"✅ <b>Вы успешно подписались!</b>\n\n"
-                f"Отчеты будут приходить в {config.MORNING_SCAN_HOUR}:{config.MORNING_SCAN_MINUTE:02d} "
-                f"и {config.EVENING_SCAN_HOUR}:{config.EVENING_SCAN_MINUTE:02d} МСК",
-                parse_mode="HTML",
-                reply_markup=get_inline_main_menu()
-            )
+            await query.edit_message_text("✅ <b>Вы подписались!</b>", parse_mode="HTML", reply_markup=get_inline_strategy_menu())
         else:
-            await query.edit_message_text(
-                "❌ Ошибка подписки. Попробуйте позже.",
-                parse_mode="HTML",
-                reply_markup=get_subscription_menu()
-            )
-    
+            await query.edit_message_text("❌ Ошибка.", reply_markup=get_subscription_menu())
     elif query.data == "sub_off":
         chat_id = query.message.chat_id
-        
         if db.remove_subscriber(chat_id):
-            await query.edit_message_text(
-                "❌ <b>Вы отписались от рассылки.</b>\n\n"
-                "Вы всегда можете подписаться снова!",
-                parse_mode="HTML",
-                reply_markup=get_inline_main_menu()
-            )
+            await query.edit_message_text("❌ <b>Вы отписались.</b>", parse_mode="HTML", reply_markup=get_inline_strategy_menu())
         else:
-            await query.edit_message_text(
-                "⚠️ Ошибка отписки. Попробуйте позже.",
-                parse_mode="HTML",
-                reply_markup=get_subscription_menu()
-            )
-    
+            await query.edit_message_text("⚠️ Ошибка.", reply_markup=get_subscription_menu())
     elif query.data == "sub_status":
         chat_id = query.message.chat_id
         subs = db.get_active_subscribers()
         is_subscribed = chat_id in subs
-        
-        status_text = (
-            f"🔔 <b>Статус подписки</b>\n\n"
-            f"Текущий статус: {'✅ Подписан' if is_subscribed else '❌ Не подписан'}\n"
-            f"ID чата: <code>{chat_id}</code>\n\n"
-        )
-        
-        if is_subscribed:
-            status_text += "Вы будете получать автоматические отчеты."
-        else:
-            status_text += "Вы не будете получать автоматические отчеты."
-        
+        status = "✅ Подписан" if is_subscribed else "❌ Не подписан"
         await query.edit_message_text(
-            status_text,
+            f"🔔 <b>Статус подписки:</b> {status}\nID: <code>{chat_id}</code>",
             parse_mode="HTML",
             reply_markup=get_subscription_menu()
         )
-    
     elif query.data == "main_menu":
         await query.edit_message_text(
-            "🤖 <b>Главное меню бота «Молоток»</b>\n\n"
-            "Выберите действие:",
+            "🤖 <b>Главное меню</b>\nВыберите стратегию:",
             parse_mode="HTML",
-            reply_markup=get_inline_main_menu()
+            reply_markup=get_inline_strategy_menu()
         )
 
-# ===== Бизнес-логика сканирования =====
+# ===== Логика сканирования =====
 
-async def run_full_scan():
-    """
-    Основная логика сканирования рынка с подробной диагностикой.
-    """
+async def run_single_strategy(update, context, strategy):
+    """Запуск стратегии через команду или кнопку."""
+    msg = await update.message.reply_text(f"⏳ Загружаю данные рынка...")
+    
+    if update.effective_chat:
+        await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
+    
     try:
-        # ДИАГНОСТИКА: Загружаем свечи SBER
-        diagnose_sber_candles()
+        result_text = await execute_scan(strategy)
+        await msg.edit_text(result_text, parse_mode="HTML")
+    except Exception as e:
+        logger.error(f"Ошибка сканирования: {e}", exc_info=True)
+        await msg.edit_text("❌ <b>Ошибка при анализе.</b> Попробуйте позже.", parse_mode="HTML")
+
+async def run_single_strategy_inline(query, context, strategy):
+    """Запуск стратегии через инлайн-кнопку."""
+    await query.edit_message_text("⏳ Загружаю данные рынка...")
+    
+    try:
+        result_text = await execute_scan(strategy)
+        await query.edit_message_text(result_text, parse_mode="HTML")
+    except Exception as e:
+        logger.error(f"Ошибка сканирования: {e}", exc_info=True)
+        await query.edit_message_text("❌ <b>Ошибка при анализе.</b>", parse_mode="HTML", reply_markup=get_inline_strategy_menu())
+
+async def execute_scan(strategy):
+    """
+    Выполняет сканирование. strategy: 'hammer', 'breakout', 'ema50', 'all'
+    Возвращает отформатированный текст.
+    """
+    global last_reports, last_scan_time
+    
+    # Загружаем данные (один раз для всех стратегий)
+    market_data = load_market_data()
+    
+    now = datetime.now(MOSCOW_TZ)
+    date_str = now.strftime("%a, %d.%m.%Y")
+    time_str = now.strftime("%H:%M МСК")
+    
+    last_scan_time = now
+    last_reports = {}
+    
+    if strategy == 'hammer':
+        candidates, stats = scan_hammer(market_data)
+        return format_hammer_report(candidates, stats, date_str, time_str)
+    
+    elif strategy == 'breakout':
+        candidates, stats = scan_breakout(market_data)
+        return format_breakout_report(candidates, stats, date_str, time_str)
+    
+    elif strategy == 'ema50':
+        candidates, stats = scan_ema50(market_data)
+        return format_ema50_report(candidates, stats, date_str, time_str)
+    
+    elif strategy == 'all':
+        # Запускаем все три
+        hammer_cand, hammer_stats = scan_hammer(market_data)
+        breakout_cand, breakout_stats = scan_breakout(market_data)
+        ema50_cand, ema50_stats = scan_ema50(market_data)
         
-        # Шаг 1: Получаем отфильтрованный список тикеров
-        logger.info("\n" + "🔍 " + "=" * 58)
-        logger.info("🔍 НАЧАЛО ПОЛНОГО СКАНИРОВАНИЯ")
-        logger.info("🔍 " + "=" * 58)
+        # Сохраняем отчёты
+        report_hammer = format_hammer_report(hammer_cand, hammer_stats, date_str, time_str)
+        report_breakout = format_breakout_report(breakout_cand, breakout_stats, date_str, time_str)
+        report_ema50 = format_ema50_report(ema50_cand, ema50_stats, date_str, time_str)
         
-        tickers_df = get_filtered_tickers()
-        
-        if tickers_df.empty:
-            logger.error("❌ КРИТИЧЕСКАЯ ОШИБКА: Не удалось загрузить список инструментов")
-            return (
-                "⚠️ <b>Не удалось загрузить список инструментов.</b>\n\n"
-                "Возможно, API Мосбиржи недоступно.\n"
-                "Попробуйте позже."
-            )
-        
-        total_loaded = len(tickers_df)
-        logger.info(f"\n📊 НАЧАЛО ФИЛЬТРАЦИИ {total_loaded} бумаг")
-        logger.info("-" * 60)
-        
-        # Шаг 2: Применяем фильтры к каждому тикеру
-        filtered_tickers = []
-        skipped = {
-            'no_candles': 0,
-            'not_share': 0,
-            'low_volume': 0,
-            'low_price': 0,
-            'api_error': 0
+        last_reports = {
+            'hammer': report_hammer,
+            'breakout': report_breakout,
+            'ema50': report_ema50
         }
         
-        examples_passed = []
-        examples_low_volume = []
-        examples_low_price = []
+        # Сводка
+        summary = (
+            f"📊 *СВОДКА СТРАТЕГИЙ*\n"
+            f"📅 {date_str} | {time_str}\n"
+            f"🔨 Молот: {hammer_stats['found']} сигнала\n"
+            f"🚀 Пробой тишины: {breakout_stats['found']} сигнала\n"
+            f"📈 Отскок от EMA 50: {ema50_stats['found']} сигнала\n"
+            f"---\n"
+            f"*Далее — детальные отчёты по каждой стратегии.*"
+        )
         
-        for idx, row in tickers_df.iterrows():
-            try:
-                ticker = row['ticker']
-                lot_size = row['lot_size']
-                short_name = row['short_name']
-                sec_type = row.get('sec_type', '')
-                
-                # Фильтр 1: Тип инструмента
-                if not is_valid_share_type(sec_type):
-                    skipped['not_share'] += 1
-                    continue
-                
-                # Загружаем свечи
-                candles = get_daily_candles(ticker, days=60)
-                if candles is None or len(candles) < 60:
-                    skipped['no_candles'] += 1
-                    continue
-                
-                # Получаем последнюю свечу
-                last_candle = candles.iloc[-1]
-                close_price = float(last_candle['close'])
-                
-                # Фильтр 2: Минимальная цена
-                if close_price <= config.MIN_PRICE:
-                    skipped['low_price'] += 1
-                    if len(examples_low_price) < 5:
-                        examples_low_price.append(f"{ticker} ({close_price:.2f}₽)")
-                    continue
-                
-                # Фильтр 3: Ликвидность
-                avg_vol_rub = calculate_average_volume_rub(candles, lot_size)
-                if avg_vol_rub < config.MIN_AVG_VOLUME_RUB:
-                    skipped['low_volume'] += 1
-                    if len(examples_low_volume) < 5:
-                        examples_low_volume.append(f"{ticker} ({avg_vol_rub:,.0f}₽/день)")
-                    continue
-                
-                # Бумага прошла все фильтры!
-                filtered_tickers.append({
-                    'ticker': ticker,
-                    'short_name': short_name,
-                    'lot_size': lot_size,
-                    'candles': candles
-                })
-                
-                if len(examples_passed) < 10:
-                    examples_passed.append(f"{ticker} ({short_name}) - цена: {close_price:.2f}₽")
-                
-            except Exception as e:
-                skipped['api_error'] += 1
-                if skipped['api_error'] <= 3:
-                    logger.error(f"Ошибка обработки {ticker}: {e}")
-                continue
+        last_reports['summary'] = summary
         
-        # ДИАГНОСТИКА: Итоги фильтрации
-        logger.info("\n" + "📊 " + "=" * 58)
-        logger.info("📊 ИТОГИ ФИЛЬТРАЦИИ")
-        logger.info("📊 " + "=" * 58)
-        logger.info(f"📥 Загружено акций (после фильтра типа): {total_loaded}")
-        logger.info(f"❌ Нет свечей/мало данных: {skipped['no_candles']}")
-        logger.info(f"❌ Цена < {config.MIN_PRICE}₽: {skipped['low_price']}")
-        logger.info(f"❌ Объем < {config.MIN_AVG_VOLUME_RUB:,.0f}₽: {skipped['low_volume']}")
-        logger.info(f"❌ Ошибки API: {skipped['api_error']}")
-        logger.info(f"✅ ОСТАЛОСЬ ДЛЯ АНАЛИЗА: {len(filtered_tickers)}")
+        # Объединяем всё
+        full_report = summary + "\n\n" + report_hammer + "\n\n" + report_breakout + "\n\n" + report_ema50
         
-        if examples_passed:
-            logger.info(f"\n✅ Примеры ПРОШЕДШИХ все фильтры (первые 10):")
-            for ex in examples_passed:
-                logger.info(f"   {ex}")
+        # Обрезаем, если слишком длинное (Telegram лимит 4096 символов)
+        if len(full_report) > 4000:
+            full_report = summary + "\n\n" + report_hammer + "\n\n" + report_breakout + "\n\n" + report_ema50
+            full_report = full_report[:4000] + "\n\n⚠️ Отчёт обрезан из-за лимита Telegram."
         
-        if examples_low_price:
-            logger.info(f"\n📉 Примеры отсеянных по цене (<{config.MIN_PRICE}₽):")
-            for ex in examples_low_price:
-                logger.info(f"   {ex}")
-        
-        if examples_low_volume:
-            logger.info(f"\n📉 Примеры отсеянных по объему (<{config.MIN_AVG_VOLUME_RUB:,.0f}₽):")
-            for ex in examples_low_volume:
-                logger.info(f"   {ex}")
-        
-        if len(filtered_tickers) == 0:
-            logger.warning("\n⚠️ ПОСЛЕ ФИЛЬТРАЦИИ НЕ ОСТАЛОСЬ БУМАГ ДЛЯ АНАЛИЗА!")
-        
-        logger.info("📊 " + "=" * 58 + "\n")
-        
-        # Шаг 3: Поиск паттерна
-        if len(filtered_tickers) == 0:
-            now_moscow = datetime.now(MOSCOW_TZ)
-            date_str = now_moscow.strftime("%a, %d.%m.%Y")
-            time_str = now_moscow.strftime("%H:%M МСК")
-            
-            return (
-                f"📅 *Ежедневный обзор «Молот» ({date_str})*\n"
-                f"🕐 Время: {time_str}\n"
-                f"📊 Проанализировано бумаг: 0\n"
-                f"❌ Качественных сигналов не найдено.\n\n"
-                f"💡 После фильтрации не осталось бумаг для анализа.\n"
-                f"Возможные причины:\n"
-                f"• Выходной день на бирже\n"
-                f"• Все бумаги ниже порога ликвидности\n"
-                f"• Технический сбой API\n\n"
-                f"Попробуйте позже в торговый день."
-            )
-        
-        logger.info(f"🔍 НАЧАЛО ПОИСКА ПАТТЕРНОВ среди {len(filtered_tickers)} бумаг")
-        
-        candidates = []
-        analyzed = 0
-        patterns_found = 0
-        
-        for item in filtered_tickers:
-            try:
-                pattern_result = find_hammer(item['candles'])
-                
-                if pattern_result:
-                    pattern_result['ticker'] = item['ticker']
-                    pattern_result['short_name'] = item['short_name']
-                    candidates.append(pattern_result)
-                    patterns_found += 1
-                
-                analyzed += 1
-                if analyzed % 50 == 0:
-                    logger.info(f"   Прогресс: {analyzed}/{len(filtered_tickers)} | Найдено: {patterns_found}")
-                    await asyncio.sleep(0.1)
-                    
-            except Exception as e:
-                logger.error(f"Ошибка анализа {item['ticker']}: {e}")
-                continue
-        
-        logger.info(f"✅ АНАЛИЗ ЗАВЕРШЕН: найдено {len(candidates)} паттернов")
-        logger.info("=" * 60 + "\n")
-        
-        # Шаг 4: Сортировка и форматирование
-        candidates.sort(key=lambda x: x['score'], reverse=True)
-        top_candidates = candidates[:config.TOP_LIMIT]
-        
-        now_moscow = datetime.now(MOSCOW_TZ)
-        date_str = now_moscow.strftime("%a, %d.%m.%Y")
-        time_str = now_moscow.strftime("%H:%M МСК")
-        
-        report_lines = [
-            f"📅 *Ежедневный обзор «Молот» ({date_str})*",
-            f"🕐 Время: {time_str}",
-            f"📊 Проанализировано бумаг: {len(filtered_tickers)}",
-        ]
-        
-        if top_candidates:
-            report_lines.append(f"✅ Найдено качественных сигналов: {len(candidates)}")
-            report_lines.append("")
-            
-            medals = ["🥇", "🥈", "🥉"] + ["  "] * 7
-            
-            for i, c in enumerate(top_candidates):
-                lines = [
-                    f"{medals[i]} *{i+1}. {c['ticker']}* ({c['short_name']})",
-                    f"   📈 Score: *{c['score']}*",
-                    f"   💰 Цена: {c['close']:.2f} ₽ | Тело: {c['body_pct']:.1f}% | Тень: {c['shadow_pct']:.1f}%",
-                    f"   📉 Поддержка: {c['support']:.2f} ₽ | Объем: {c['volume_ratio']:.1f}x от среднего",
-                    ""
-                ]
-                report_lines.extend(lines)
-            
-            report_lines.append(
-                "💡 *Что делать с сигналами?*\n"
-                "Проверь график в Т-Инвестициях. Если «Молот» подтверждается визуально — "
-                "выставляй лимитную заявку со стоп-лоссом -2%."
-            )
-        else:
-            report_lines.append("❌ Качественных сигналов не найдено.")
-            report_lines.append("")
-            report_lines.append(
-                "💡 Рынок не дает надёжных разворотных паттернов. "
-                "Сегодня без сделок. Жди следующий день."
-            )
-        
-        return "\n".join(report_lines)
-        
-    except Exception as e:
-        logger.error(f"❌ КРИТИЧЕСКАЯ ОШИБКА: {e}", exc_info=True)
-        return f"⚠️ Ошибка при сканировании: {str(e)[:200]}"
+        return full_report
+    
+    return "⚠️ Неизвестная стратегия."
 
 async def scheduled_scan(context: ContextTypes.DEFAULT_TYPE):
     """Задача для автоматической рассылки."""
-    global last_scan_report, last_scan_time
+    global last_reports, last_scan_time
     
     logger.info("📅 Запуск планового сканирования...")
     
@@ -669,25 +390,36 @@ async def scheduled_scan(context: ContextTypes.DEFAULT_TYPE):
         return
     
     try:
-        scan_result = await run_full_scan()
-        last_scan_report = scan_result
-        last_scan_time = datetime.now(MOSCOW_TZ)
+        # Выполняем все стратегии
+        await execute_scan('all')
         
-        success = 0
+        # Отправляем подписчикам
         for chat_id in subscribers:
             try:
-                await context.bot.send_message(
-                    chat_id=chat_id,
-                    text=scan_result,
-                    parse_mode="HTML"
-                )
-                success += 1
+                # Отправляем сводку и отчёты
+                if 'summary' in last_reports:
+                    await context.bot.send_message(
+                        chat_id=chat_id,
+                        text=last_reports['summary'],
+                        parse_mode="HTML"
+                    )
+                    await asyncio.sleep(0.5)
+                
+                for report_name in ['hammer', 'breakout', 'ema50']:
+                    if report_name in last_reports:
+                        await context.bot.send_message(
+                            chat_id=chat_id,
+                            text=last_reports[report_name],
+                            parse_mode="HTML"
+                        )
+                        await asyncio.sleep(0.5)
+                        
             except Exception as e:
                 logger.error(f"Ошибка отправки {chat_id}: {e}")
                 if "bot was blocked" in str(e).lower():
                     db.remove_subscriber(chat_id)
         
-        logger.info(f"Рассылка завершена: {success}/{len(subscribers)}")
+        logger.info(f"Рассылка завершена: {len(subscribers)} подписчиков")
         
     except Exception as e:
         logger.error(f"Ошибка плановой рассылки: {e}", exc_info=True)
@@ -702,14 +434,21 @@ async def setup_bot():
     
     application = Application.builder().token(config.TELEGRAM_TOKEN).build()
     
-    # Регистрация обработчиков
+    # Регистрация обработчиков команд
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("help", help_command))
-    application.add_handler(CommandHandler("scan", scan_command))
+    application.add_handler(CommandHandler("scan", scan_all_command))
+    application.add_handler(CommandHandler("hammer", hammer_command))
+    application.add_handler(CommandHandler("breakout", breakout_command))
+    application.add_handler(CommandHandler("ema50", ema50_command))
     application.add_handler(CommandHandler("stats", stats_command))
     application.add_handler(CommandHandler("subscribe", subscribe_command))
     application.add_handler(CommandHandler("unsubscribe", unsubscribe_command))
+    
+    # Обработчик текстовых сообщений (кнопки меню)
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    
+    # Обработчик инлайн-кнопок
     application.add_handler(CallbackQueryHandler(button_handler))
     
     # Настройка планировщика
@@ -730,11 +469,7 @@ async def setup_bot():
     )
     scheduler.start()
     
-    logger.info(
-        f"⏰ Планировщик запущен: "
-        f"{config.MORNING_SCAN_HOUR}:{config.MORNING_SCAN_MINUTE:02d} и "
-        f"{config.EVENING_SCAN_HOUR}:{config.EVENING_SCAN_MINUTE:02d} МСК"
-    )
+    logger.info(f"⏰ Планировщик запущен: {config.MORNING_SCAN_HOUR}:{config.MORNING_SCAN_MINUTE:02d} и {config.EVENING_SCAN_HOUR}:{config.EVENING_SCAN_MINUTE:02d} МСК")
     
     await application.initialize()
     await application.start()
