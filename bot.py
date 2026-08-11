@@ -5,6 +5,9 @@ from datetime import datetime
 import pytz
 from aiohttp import web
 
+from squeeze_scanner import scan_squeeze, format_squeeze_report
+from double_bottom_scanner import scan_double_bottom, format_double_bottom_report
+
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, KeyboardButton
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes, MessageHandler, filters
 
@@ -42,7 +45,8 @@ def get_main_keyboard():
     """Основное меню бота (постоянная клавиатура)."""
     keyboard = [
         [KeyboardButton("🔨 Молот"), KeyboardButton("🚀 Пробой тишины")],
-        [KeyboardButton("📈 Отскок от EMA 50"), KeyboardButton("📊 Все стратегии")],
+        [KeyboardButton("📈 Отскок от EMA 50"), KeyboardButton("🌀 Сжатая пружина")],
+        [KeyboardButton("🏔️ Двойное дно"), KeyboardButton("📊 Все стратегии")],
         [KeyboardButton("ℹ️ Помощь"), KeyboardButton("📋 Статистика")]
     ]
     return ReplyKeyboardMarkup(keyboard, resize_keyboard=True, persistent=True)
@@ -52,7 +56,9 @@ def get_inline_strategy_menu():
     keyboard = [
         [InlineKeyboardButton("🔨 Молот", callback_data="scan_hammer"),
          InlineKeyboardButton("🚀 Пробой тишины", callback_data="scan_breakout")],
-        [InlineKeyboardButton("📈 Отскок от EMA 50", callback_data="scan_ema50")],
+        [InlineKeyboardButton("📈 Отскок от EMA 50", callback_data="scan_ema50"),
+         InlineKeyboardButton("🌀 Сжатая пружина", callback_data="scan_squeeze")],
+        [InlineKeyboardButton("🏔️ Двойное дно", callback_data="scan_double_bottom")],
         [InlineKeyboardButton("📊 ВСЕ СТРАТЕГИИ", callback_data="scan_all")],
         [InlineKeyboardButton("📊 Статистика", callback_data="stats")],
         [InlineKeyboardButton("🔔 Подписка", callback_data="subscription")]
@@ -214,6 +220,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await help_command(update, context)
     elif text == "📋 Статистика":
         await stats_command(update, context)
+    elif text == "🌀 Сжатая пружина":
+        await run_single_strategy(update, context, 'squeeze')
+    elif text == "🏔️ Двойное дно":
+        await run_single_strategy(update, context, 'double_bottom')
 
 # ===== Обработчик инлайн-кнопок =====
 
@@ -228,6 +238,10 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await run_single_strategy_inline(query, context, 'breakout')
     elif query.data == "scan_ema50":
         await run_single_strategy_inline(query, context, 'ema50')
+    elif query.data == "scan_squeeze":
+        await run_single_strategy_inline(query, context, 'squeeze')
+    elif query.data == "scan_double_bottom":
+        await run_single_strategy_inline(query, context, 'double_bottom')
     elif query.data == "scan_all":
         await run_single_strategy_inline(query, context, 'all')
     elif query.data == "stats":
@@ -335,31 +349,47 @@ async def execute_scan(strategy):
     elif strategy == 'ema50':
         candidates, stats = scan_ema50(market_data)
         return format_ema50_report(candidates, stats, date_str, time_str)
+
+    elif strategy == 'squeeze':
+        candidates, stats = scan_squeeze(market_data)
+        return format_squeeze_report(candidates, stats, date_str, time_str)
     
-    elif strategy == 'all':
-        # Запускаем все три
+    elif strategy == 'double_bottom':
+        candidates, stats = scan_double_bottom(market_data)
+        return format_double_bottom_report(candidates, stats, date_str, time_str)
+    
+   elif strategy == 'all':
+        # Запускаем все пять стратегий
         hammer_cand, hammer_stats = scan_hammer(market_data)
         breakout_cand, breakout_stats = scan_breakout(market_data)
         ema50_cand, ema50_stats = scan_ema50(market_data)
+        squeeze_cand, squeeze_stats = scan_squeeze(market_data)
+        db_cand, db_stats = scan_double_bottom(market_data)
         
-        # Сохраняем отчёты
+        # Форматируем отчёты
         report_hammer = format_hammer_report(hammer_cand, hammer_stats, date_str, time_str)
         report_breakout = format_breakout_report(breakout_cand, breakout_stats, date_str, time_str)
         report_ema50 = format_ema50_report(ema50_cand, ema50_stats, date_str, time_str)
+        report_squeeze = format_squeeze_report(squeeze_cand, squeeze_stats, date_str, time_str)
+        report_db = format_double_bottom_report(db_cand, db_stats, date_str, time_str)
         
         last_reports = {
             'hammer': report_hammer,
             'breakout': report_breakout,
-            'ema50': report_ema50
+            'ema50': report_ema50,
+            'squeeze': report_squeeze,
+            'double_bottom': report_db
         }
         
-        # Сводка (используем 'passed' вместо 'found')
+        # Сводка (5 стратегий)
         summary = (
             f"📊 *СВОДКА СТРАТЕГИЙ*\n"
             f"📅 {date_str} | {time_str}\n"
-            f"🔨 Молот: {hammer_stats['passed']} сигнала\n"
-            f"🚀 Пробой тишины: {breakout_stats['passed']} сигнала\n"
-            f"📈 Отскок от EMA 50: {ema50_stats['passed']} сигнала\n"
+            f"🔨 Молот: {hammer_stats['passed']} сигналов\n"
+            f"🚀 Пробой тишины: {breakout_stats['passed']} сигналов\n"
+            f"📈 Отскок от EMA 50: {ema50_stats['passed']} сигналов\n"
+            f"🌀 Сжатая пружина: {squeeze_stats['passed']} сигналов\n"
+            f"🏔️ Двойное дно: {db_stats['passed']} сигналов\n"
             f"---\n"
             f"*Далее — детальные отчёты по каждой стратегии.*"
         )
@@ -367,9 +397,16 @@ async def execute_scan(strategy):
         last_reports['summary'] = summary
         
         # Объединяем всё
-        full_report = summary + "\n\n" + report_hammer + "\n\n" + report_breakout + "\n\n" + report_ema50
+        full_report = (
+            summary + "\n\n" + 
+            report_hammer + "\n\n" + 
+            report_breakout + "\n\n" + 
+            report_ema50 + "\n\n" + 
+            report_squeeze + "\n\n" + 
+            report_db
+        )
         
-        # Обрезаем, если слишком длинное (Telegram лимит 4096)
+        # Обрезаем для Telegram
         if len(full_report) > 4000:
             full_report = full_report[:4000] + "\n\n⚠️ Отчёт обрезан из-за лимита Telegram."
         
@@ -440,6 +477,8 @@ async def setup_bot():
     application.add_handler(CommandHandler("hammer", hammer_command))
     application.add_handler(CommandHandler("breakout", breakout_command))
     application.add_handler(CommandHandler("ema50", ema50_command))
+    application.add_handler(CommandHandler("squeeze", squeeze_command))
+    application.add_handler(CommandHandler("doublebottom", double_bottom_command))
     application.add_handler(CommandHandler("stats", stats_command))
     application.add_handler(CommandHandler("subscribe", subscribe_command))
     application.add_handler(CommandHandler("unsubscribe", unsubscribe_command))
@@ -502,6 +541,12 @@ async def main():
         if 'application' in locals():
             await application.stop()
             await application.shutdown()
+
+async def squeeze_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await run_single_strategy(update, context, 'squeeze')
+
+async def double_bottom_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await run_single_strategy(update, context, 'double_bottom')
 
 if __name__ == "__main__":
     asyncio.run(main())
