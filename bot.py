@@ -336,7 +336,7 @@ async def execute_scan(strategy):
         candidates, stats = scan_ema50(market_data)
         return format_ema50_report(candidates, stats, date_str, time_str)
     
-        elif strategy == 'all':
+    elif strategy == 'all':
         # Запускаем все три
         hammer_cand, hammer_stats = scan_hammer(market_data)
         breakout_cand, breakout_stats = scan_breakout(market_data)
