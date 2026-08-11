@@ -11,23 +11,29 @@ logger = logging.getLogger(__name__)
 def scan_hammer(market_data):
     """
     Стратегия «Молот» — разворот у поддержки.
-    Возвращает список сигналов и статистику отсева.
+    С подробным логированием.
     """
     candidates = []
     stats = {
         'total': len(market_data),
-        'no_candles': 0,
+        'no_data': 0,
         'no_pattern': 0,
         'no_volume': 0,
         'no_support': 0,
-        'found': 0
+        'passed': 0,
+        'errors': 0
     }
     
+    all_processed = 0
+    
     for item in market_data:
+        ticker = item['ticker']
+        all_processed += 1
+        
         try:
             df = item['data']
             if df is None or len(df) < 60:
-                stats['no_candles'] += 1
+                stats['no_data'] += 1
                 continue
             
             last = df.iloc[-1]
@@ -79,13 +85,11 @@ def scan_hammer(market_data):
             
             # Объём
             avg_vol = float(df['avg_volume_20'].iloc[-1])
-            if avg_vol == 0 or volume <= avg_vol:
+            if pd.isna(avg_vol) or avg_vol == 0 or volume <= avg_vol:
                 stats['no_volume'] += 1
                 continue
             
             volume_ratio = volume / avg_vol
-            
-            # Score
             score = round((lower_shadow / body) * volume_ratio, 2)
             
             candidates.append({
@@ -99,14 +103,32 @@ def scan_hammer(market_data):
                 'volume_ratio': round(volume_ratio, 1)
             })
             
-            stats['found'] += 1
+            stats['passed'] += 1
             
         except Exception as e:
-            logger.error(f"Ошибка Молот {item.get('ticker', '?')}: {e}")
+            stats['errors'] += 1
             continue
     
+    total_checked = all_processed - stats['no_data'] - stats['errors']
+    sum_filters = stats['no_pattern'] + stats['no_support'] + stats['no_volume'] + stats['passed']
+    
+    logger.info(f"\n📊 ИТОГИ МОЛОТ:")
+    logger.info(f"   Проверено: {total_checked}")
+    logger.info(f"   ❌ Нет паттерна: {stats['no_pattern']}")
+    logger.info(f"   ❌ Нет поддержки: {stats['no_support']}")
+    logger.info(f"   ❌ Нет объёма: {stats['no_volume']}")
+    logger.info(f"   ✅ Прошли: {stats['passed']}")
+    
+    if sum_filters != total_checked:
+        logger.warning(f"⚠️ Расхождение: сумма={sum_filters}, проверено={total_checked}")
+    
     candidates.sort(key=lambda x: x['score'], reverse=True)
-    return candidates[:TOP_LIMIT], stats
+    top_candidates = candidates[:TOP_LIMIT]
+    
+    logger.info(f"   Бумаг после всех фильтров: {len(candidates)}")
+    logger.info(f"   Отправлено в Telegram: {len(top_candidates)}")
+    
+    return top_candidates, stats
 
 
 def format_hammer_report(candidates, stats, date_str, time_str):
@@ -114,7 +136,7 @@ def format_hammer_report(candidates, stats, date_str, time_str):
     lines = [
         "🔨 *МОЛОТ — разворот у поддержки*",
         f"📅 {date_str} | {time_str}",
-        f"📊 Проанализировано: {stats['total']} | Найдено: {stats['found']}",
+        f"📊 Проанализировано: {stats['total']} | Найдено: {stats['passed']}",
         ""
     ]
     
