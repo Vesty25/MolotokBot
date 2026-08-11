@@ -8,13 +8,6 @@ logger = logging.getLogger(__name__)
 def add_all_indicators(df):
     """
     Добавляет все технические индикаторы к DataFrame со свечами.
-    
-    Принимает DataFrame с колонками: open, close, high, low, volume
-    Возвращает DataFrame с добавленными колонками:
-        ema_20, ema_50, ema_200
-        rsi_14
-        bb_upper, bb_middle, bb_lower
-        avg_volume_20
     """
     if df is None or len(df) == 0:
         return None
@@ -35,6 +28,9 @@ def add_all_indicators(df):
     df['bb_upper'] = df['bb_middle'] + 2 * bb_std
     df['bb_lower'] = df['bb_middle'] - 2 * bb_std
     
+    # Bandwidth (ширина полосы)
+    df['bandwidth'] = (df['bb_upper'] - df['bb_lower']) / df['bb_middle']
+    
     # Средний объём за 20 дней
     df['avg_volume_20'] = df['volume'].rolling(window=20).mean()
     
@@ -42,9 +38,7 @@ def add_all_indicators(df):
 
 
 def calculate_rsi(series, period=14):
-    """
-    Рассчитывает RSI (Relative Strength Index) без сторонних библиотек.
-    """
+    """Рассчитывает RSI без сторонних библиотек."""
     delta = series.diff()
     
     gain = delta.where(delta > 0, 0.0)
@@ -53,7 +47,6 @@ def calculate_rsi(series, period=14):
     avg_gain = gain.rolling(window=period, min_periods=period).mean()
     avg_loss = loss.rolling(window=period, min_periods=period).mean()
     
-    # Используем экспоненциальное сглаживание после первого периода
     for i in range(period, len(avg_gain)):
         avg_gain.iloc[i] = (avg_gain.iloc[i-1] * (period - 1) + gain.iloc[i]) / period
         avg_loss.iloc[i] = (avg_loss.iloc[i-1] * (period - 1) + loss.iloc[i]) / period
@@ -65,9 +58,7 @@ def calculate_rsi(series, period=14):
 
 
 def get_support_level(df, days=60):
-    """
-    Возвращает минимальную цену low за последние N дней.
-    """
+    """Возвращает минимальную цену low за последние N дней."""
     if df is None or len(df) < days:
         return None
     return float(df['low'].tail(days).min())
