@@ -201,3 +201,93 @@ def load_market_data():
     logger.info("=" * 60)
     
     return market_data
+
+def load_imoex_index():
+    """
+    Загружает дневные свечи индекса IMOEX.
+    Возвращает DataFrame с колонками: open, close, high, low, volume, date
+    и дополнительные расчёты: day_change_pct, change_5d_pct
+    """
+    today = datetime.now()
+    one_year_ago = today - timedelta(days=365)
+    
+    url = "https://iss.moex.com/iss/engines/stock/markets/index/securities/IMOEX/candles.json"
+    params = {
+        "interval": 24,
+        "iss.meta": "off",
+        "iss.only": "candles",
+        "candles.columns": "open,close,high,low,volume,begin",
+        "from": one_year_ago.strftime("%Y-%m-%d"),
+        "till": today.strftime("%Y-%m-%d")
+    }
+    
+    try:
+        logger.info("Загрузка индекса IMOEX...")
+        resp = requests.get(url, params=params, timeout=15)
+        resp.raise_for_status()
+        data = resp.json()
+        
+        if 'candles' not in data or len(data['candles']['data']) == 0:
+            logger.warning("Не удалось загрузить IMOEX")
+            return None
+        
+        df = pd.DataFrame(
+            data['candles']['data'],
+            columns=data['candles']['columns']
+        )
+        
+        df['date'] = pd.to_datetime(df['begin'])
+        df = df.sort_values('date', ascending=True)
+        
+        # Конвертируем числовые колонки
+        for col in ['open', 'close', 'high', 'low', 'volume']:
+            df[col] = pd.to_numeric(df[col], errors='coerce')
+        
+        # Изменение за день (%)
+        df['day_change_pct'] = df['close'].pct_change() * 100
+        
+        # Изменение за 5 дней (%)
+        df['change_5d_pct'] = df['close'].pct_change(periods=5) * 100
+        
+        # Добавляем индикаторы
+        df = add_all_indicators(df)
+        
+        logger.info(f"IMOEX загружен: {len(df)} свечей")
+        logger.info(f"IMOEX последняя: {df['date'].iloc[-1].strftime('%Y-%m-%d')} | Close: {df['close'].iloc[-1]:.2f} | Изменение: {df['day_change_pct'].iloc[-1]:.2f}%")
+        
+        return df
+        
+    except Exception as e:
+        logger.error(f"Ошибка загрузки IMOEX: {e}")
+        return None
+
+
+def get_imoex_analysis(imoex_df):
+    """
+    Возвращает ключевые показатели индекса для анализа паники.
+    """
+    if imoex_df is None or len(imoex_df) < 6:
+        return {
+            'available': False,
+            'day_change_pct': 0,
+            'change_5d_pct': 0,
+            'is_panic': False,
+            'close': None
+        }
+    
+    last = imoex_df.iloc[-1]
+    
+    day_change = float(last['day_change_pct']) if pd.notna(last['day_change_pct']) else 0
+    change_5d = float(last['change_5d_pct']) if pd.notna(last['change_5d_pct']) else 0
+    
+    from config import PANIC_THRESHOLD_PCT
+    
+    is_panic = day_change <= -PANIC_THRESHOLD_PCT
+    
+    return {
+        'available': True,
+        'day_change_pct': round(day_change, 2),
+        'change_5d_pct': round(change_5d, 2),
+        'is_panic': is_panic,
+        'close': float(last['close'])
+    }
